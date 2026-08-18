@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ddi-reconciler"
+version = "0.1.0" # x-release-please-version
+description = "Safety-first DNS reconciliation: converge Azure Private DNS and Cloudflare toward a verified source of truth"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.32",
+  "azure-identity>=1.17",
+  # >=2.0: conditional writes use the keyword-only etag=/match_condition=
+  # convention this generation introduced.
+  "azure-mgmt-privatedns>=2.0",
+]
+
+[project.scripts]
+ddi-reconcile = "ddi_reconciler.cli:main"
+
+[dependency-groups]
+dev = ["pytest", "responses>=0.25", "ruff>=0.12"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ddi_reconciler"]
+
+[tool.ruff.lint]
+# TRY004 wants TypeError from isinstance guards. This codebase's deliberate
+# contract is RuntimeError("<provider> API error ...") for every malformed
+# payload: RuntimeError maps to exit 1, a TypeError would escape as a
+# traceback and break the 0/1/2 contract drift automation depends on.
+ignore = ["TRY004"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests raise bare Exception on purpose: fakes simulate "whatever the SDK
+# might throw"; the assertion is that ANY exception wraps into RuntimeError.
+"tests/*" = ["TRY002"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ddi_reconciler"]
