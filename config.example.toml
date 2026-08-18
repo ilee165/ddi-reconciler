@@ -1,0 +1,28 @@
+# ddi-reconciler configuration — NO SECRETS in this file. Identity comes
+# from env: SPATIUM_API_TOKEN, CLOUDFLARE_API_TOKEN, AZURE_SUBSCRIPTION_ID
+# (+ az login / OIDC).
+#
+# managed_keys is the ownership allowlist: the reconciler can never add,
+# update, or DELETE a record whose (zone, name, type) is not listed here.
+
+[spatium]
+base_url = "http://localhost:8000"
+
+[azure]
+resource_group = "rg-dns-lab"
+
+[[edges]]
+name = "azure-private"
+provider = "azure"
+zone = "internal.example.com"
+managed_keys = [
+  ["internal.example.com", "app", "A"],
+]
+
+[[edges]]
+name = "cloudflare-public"
+provider = "cloudflare"
+zone = "example.com"
+managed_keys = [
+  ["example.com", "demo", "CNAME"],
+]
