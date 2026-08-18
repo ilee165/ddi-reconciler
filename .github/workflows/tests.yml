@@ -1,0 +1,38 @@
+name: tests
+
+# The suite's defining property: it runs offline with zero credentials.
+# This job deliberately grants nothing — no secrets, no id-token, no cloud
+# login. If a test ever starts needing a credential or a network call, it
+# fails here rather than silently becoming untestable in CI.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          # The action SHA pins the installer, not what it installs —
+          # without `version:` it fetches the latest uv release at run time.
+          version: "0.12.5"
+          enable-cache: true
+      - name: Install
+        run: uv sync --frozen
+      - name: Lint (ruff)
+        run: uv run ruff check .
+      - name: Test suite (no credentials in the environment)
+        env:
+          SPATIUM_API_TOKEN: ""
+          CLOUDFLARE_API_TOKEN: ""
+          AZURE_SUBSCRIPTION_ID: ""
+          AZURE_CLIENT_ID: ""
+          AZURE_TENANT_ID: ""
+        run: uv run pytest -q
