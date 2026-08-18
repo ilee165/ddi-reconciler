@@ -19,6 +19,13 @@ A snapshot is a JSON envelope with this structure:
       "rtype": "CNAME",
       "values": ["target.example.com"],
       "ttl": 3600
+    },
+    {
+      "zone": "internal.example.com",
+      "name": "app",
+      "rtype": "A",
+      "values": ["10.0.0.1"],
+      "ttl": 300
     }
   ]
 }
