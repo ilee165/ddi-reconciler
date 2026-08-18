@@ -1,8 +1,8 @@
 """Desired-state snapshot: CanonicalRecords <-> committed JSON file.
 
-Nightly CI cannot reach the laptop's SpatiumDDI API, so sessions export truth
-to ddi-reconciler/desired-records.json and drift runs compare edges against
-that committed snapshot (ADR-006).
+CI, or any environment that cannot reach the truth API, reconciles against a
+committed snapshot instead: truth is exported to desired-records.json ahead of
+time, and drift runs compare edges against that committed snapshot.
 
 The snapshot is a delete order for everything it omits, so it has to be able to
 prove it arrived whole. Format v2 is therefore self-describing:

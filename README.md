@@ -2,6 +2,8 @@
 
 Safety-first DNS reconciliation: converge Azure Private DNS and Cloudflare toward a verified source of truth.
 
+SpatiumDDI is the DDI control plane this reconciler was built against, serving as that source of truth. It's not required, though — any truth source works: implement the `TruthSource` protocol, or reconcile against an exported snapshot.
+
 ## Why not octoDNS/DNSControl?
 
 octoDNS and DNSControl are mature, general-purpose DNS-as-code tools with broad provider support — if you want one config format across a dozen providers, they're a better fit than this project. `ddi-reconciler` is narrower and makes different trade-offs on purpose:

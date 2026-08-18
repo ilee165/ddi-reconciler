@@ -151,7 +151,7 @@ def test_every_supported_record_type_still_loads(tmp_path, rtype):
 # loaded a real config.toml at the repo root. That file held private,
 # environment-specific values and is deliberately excluded from this
 # extraction per the disclosure-sweep gate. This OSS repo ships a generic
-# config.example.toml instead (Task 3), with its own equivalent parse-guarantee
+# config.example.toml instead, with its own equivalent parse-guarantee
 # test in tests/test_example_config.py.
 
 

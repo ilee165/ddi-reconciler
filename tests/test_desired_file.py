@@ -13,7 +13,7 @@ from ddi_reconciler.desired_file import (
 from ddi_reconciler.model import CanonicalRecord
 
 
-def _rec(name, zone="z.co", value="1.1.1.1"):
+def _rec(name, zone="z.test", value="1.1.1.1"):
     return CanonicalRecord(zone=zone, name=name, rtype="A", values=(value,))
 
 
@@ -47,7 +47,7 @@ def test_snapshot_is_sorted_and_stable(tmp_path):
 
 def test_invalid_record_in_file_raises(tmp_path):
     path = tmp_path / "bad.json"
-    path.write_text(json.dumps([{"zone": "z.co", "name": "x", "rtype": "BOGUS",
+    path.write_text(json.dumps([{"zone": "z.test", "name": "x", "rtype": "BOGUS",
                                  "values": ["v"], "ttl": 300}]))
     with pytest.raises(ValueError, match="unsupported record type"):
         load_desired(path)
@@ -64,7 +64,7 @@ def test_saved_snapshot_declares_version_count_and_checksum(tmp_path):
     assert body["count"] == 2 == len(body["records"])
     assert body["checksum"].startswith("sha256:")
     assert body["truth_verified"] is True
-    assert body["records"][0] == {"zone": "z.co", "name": "a", "rtype": "A",
+    assert body["records"][0] == {"zone": "z.test", "name": "a", "rtype": "A",
                                   "values": ["1.1.1.1"], "ttl": 300}
 
 
@@ -145,7 +145,7 @@ def test_a_bare_list_loads_but_is_not_verified(tmp_path, capsys):
     because refusing it would break a dry-run that never deletes — but it can
     prove nothing, so runner.plan_edge will not delete from it."""
     path = tmp_path / "desired.json"
-    path.write_text(json.dumps([{"zone": "z.co", "name": "a", "rtype": "A",
+    path.write_text(json.dumps([{"zone": "z.test", "name": "a", "rtype": "A",
                                  "values": ["1.1.1.1"], "ttl": 300}]))
     records, verified = load_desired(path)
     assert [r.name for r in records] == ["a"]
@@ -197,8 +197,8 @@ def test_export_may_grow_or_stay_the_same_size(tmp_path):
 def test_export_still_shrink_checks_a_pre_v1_bare_list_prior(tmp_path):
     path = tmp_path / "desired.json"
     path.write_text(json.dumps([
-        {"zone": "z.co", "name": "a", "rtype": "A", "values": ["1.1.1.1"], "ttl": 300},
-        {"zone": "z.co", "name": "b", "rtype": "A", "values": ["1.1.1.1"], "ttl": 300},
+        {"zone": "z.test", "name": "a", "rtype": "A", "values": ["1.1.1.1"], "ttl": 300},
+        {"zone": "z.test", "name": "b", "rtype": "A", "values": ["1.1.1.1"], "ttl": 300},
     ]))
     with pytest.raises(SnapshotError, match="refusing to shrink"):
         _save([_rec("a")], path)
@@ -257,13 +257,13 @@ def test_missing_field_names_the_field_not_an_env_var(tmp_path):
     """A KeyError from snapshot data used to surface as
     'missing required environment variable: ttl'."""
     path = tmp_path / "bad.json"
-    path.write_text(json.dumps([{"zone": "z.co", "name": "x", "rtype": "A",
+    path.write_text(json.dumps([{"zone": "z.test", "name": "x", "rtype": "A",
                                  "values": ["1.1.1.1"]}]))
     with pytest.raises(ValueError, match="entry 0 is missing field\\(s\\): ttl"):
         load_desired(path)
 
 
-@pytest.mark.parametrize("body", ['{"zone": "z.co"}', "[1, 2]", '[{"values": "x"}]', "not json"])
+@pytest.mark.parametrize("body", ['{"zone": "z.test"}', "[1, 2]", '[{"values": "x"}]', "not json"])
 def test_malformed_snapshot_is_a_clear_value_error(tmp_path, body):
     path = tmp_path / "bad.json"
     path.write_text(body)
@@ -276,7 +276,7 @@ def test_a_non_string_name_field_is_a_value_error_not_an_attributeerror(tmp_path
     """`canonical_name(42)` raises AttributeError: 'int' object has no attribute
     'strip', which escapes the CLI's handled tuple and prints a traceback.
     config.py already closed this class; the snapshot path must match."""
-    entry = {"zone": "z.co", "name": "x", "rtype": "A", "values": ["1.1.1.1"], "ttl": 300}
+    entry = {"zone": "z.test", "name": "x", "rtype": "A", "values": ["1.1.1.1"], "ttl": 300}
     entry[field] = 42
     path = tmp_path / "bad.json"
     path.write_text(json.dumps([entry]))
@@ -287,7 +287,7 @@ def test_a_non_string_name_field_is_a_value_error_not_an_attributeerror(tmp_path
 @pytest.mark.parametrize("ttl", [["300"], {"seconds": 300}, None])
 def test_a_non_integer_ttl_is_a_value_error_not_a_traceback(tmp_path, ttl):
     path = tmp_path / "bad.json"
-    path.write_text(json.dumps([{"zone": "z.co", "name": "x", "rtype": "A",
+    path.write_text(json.dumps([{"zone": "z.test", "name": "x", "rtype": "A",
                                  "values": ["1.1.1.1"], "ttl": ttl}]))
     with pytest.raises(ValueError, match="invalid snapshot"):
         load_desired(path)
@@ -324,7 +324,7 @@ def test_a_v1_snapshot_is_rejected_naming_reexport(tmp_path):
     """Legacy v1 files hash only their records, so their provenance flag is
     unverifiable — they are refused outright rather than half-trusted. The
     migration path is a re-export, and the error must say so."""
-    records = [{"zone": "z.co", "name": "app", "rtype": "A",
+    records = [{"zone": "z.test", "name": "app", "rtype": "A",
                 "values": ["1.1.1.1"], "ttl": 300}]
     v1_canonical = json.dumps(records, sort_keys=True, separators=(",", ":"))
     import hashlib

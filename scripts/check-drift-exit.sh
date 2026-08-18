@@ -1,6 +1,6 @@
 #!/bin/sh
-# Exit-code gate for ddi-reconcile in the scheduled drift workflow (WR-01,
-# 2026-08-08 review). The CLI's contract is 0 converged / 1 operational error /
+# Exit-code gate for use in a scheduled drift job (see README exit-code
+# contract). The CLI's contract is 0 converged / 1 operational error /
 # 2 drift found. The old inline check failed only on exactly 1 and assumed
 # everything else was 0-or-2, so a 126/127 (tool missing), 137 (OOM kill), or
 # any future contract regression left the schedule green and silent.
