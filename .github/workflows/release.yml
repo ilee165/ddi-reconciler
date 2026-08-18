@@ -1,0 +1,72 @@
+# Release automation: release-please maintains a rolling release PR that
+# accumulates conventional commits landing on main. Merging that PR cuts the
+# tag, the GitHub release, and the changelog in one step. Versioning is
+# repo-wide (single manifest entry at "."); pyproject.toml's version is kept
+# in lockstep via the extra-files updater.
+#
+# The extra-files updater rewrites pyproject.toml but knows nothing about uv,
+# so uv.lock's entry for this package would lag one release behind the
+# version bump. The lock-refresh job below closes that gap: whenever
+# release-please has a release PR open, it regenerates the lock on that PR's
+# branch so the version bump and the lock change merge together.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      prs_created: ${{ steps.release.outputs.prs_created }}
+      pr: ${{ steps.release.outputs.pr }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Keeps uv.lock in step with the pyproject.toml version release-please just
+  # wrote. Runs on the release PR's branch, not main, so the lock change rides
+  # the same merge as the version bump.
+  #
+  # Two properties make the loop safe:
+  #   - release-please force-pushes its branch on every update, which discards
+  #     this job's commit — but every such update comes from a push to main,
+  #     which re-runs this workflow and re-adds the commit. It converges.
+  #   - The push uses GITHUB_TOKEN, which never triggers other workflows. The
+  #     release PR is created by the same token, so its checks situation is
+  #     unchanged by this commit appearing on the branch.
+  lock-refresh:
+    needs: release-please
+    if: needs.release-please.outputs.prs_created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          # WR-04 (same as reconciler-tests): the action SHA pins the
+          # installer, not what it installs — pin the tool itself too.
+          version: "0.12.5"
+          enable-cache: true
+      - name: Regenerate uv.lock against the bumped pyproject.toml
+        run: uv lock
+      - name: Commit the lock to the release PR branch if it changed
+        run: |
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already in sync; nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore: sync uv.lock with release-please version bump"
+          git push
