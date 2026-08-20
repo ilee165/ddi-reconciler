@@ -121,6 +121,19 @@ class CloudflareProvider:
         self.proxied_keys: set[RecordKey] = set()
 
     # --- plumbing -----------------------------------------------------------
+    @property
+    def unparseable_keys(self) -> dict[RecordKey, str]:
+        """`skipped`, in the shape runner.plan_edge consults on every provider.
+
+        The runner's observed-keys set (its CR-04 type-conflict preflight) and
+        its unwritable-key refusal read `blocked_keys`/`unparseable_keys` by
+        those names; publishing `skipped` only under its own name made every
+        record this adapter could not represent invisible to both — physically
+        present at the edge, it still collides with a planned create, and the
+        preflight exists to refuse that up front rather than fail on the POST.
+        """
+        return dict(self.skipped)
+
     @staticmethod
     def _warn(message: str) -> None:
         print(f"warning: {message}", file=sys.stderr)
@@ -171,8 +184,18 @@ class CloudflareProvider:
             if not isinstance(zone_id, str) or not zone_id:
                 raise RuntimeError(
                     f"cloudflare API error: zone {self.zone_name!r} carries no usable id")
-            self._zone_id = zone_id
+            # Ids are the server's data, not the operator's (same rule as the
+            # spatium adapter's _segment): escape before the id is ever
+            # interpolated into a URL path, so a value carrying '/', '?' or
+            # '#' cannot re-point a request at another endpoint.
+            self._zone_id = quote(zone_id, safe="")
         return self._zone_id
+
+    @staticmethod
+    def _record_path(zone_id: str, raw: dict) -> str:
+        """The dns_records path for one raw API record, its server-supplied id
+        escaped for the same reason _zone() escapes the zone id."""
+        return f"/zones/{zone_id}/dns_records/{quote(str(raw['id']), safe='')}"
 
     def _relative(self, fqdn: str) -> str:
         name = canonical_name(fqdn)
@@ -432,9 +455,20 @@ class CloudflareProvider:
             fields["proxied"] = False
         return fields
 
-    def _record(self, existing: dict[str, dict], value: str, key: RecordKey) -> dict:
-        """The raw API record carrying `value` — or an error that says which of
-        two very different causes applies."""
+    def _records_for(self, existing: dict[str, list[dict]], value: str,
+                     key: RecordKey) -> list[dict]:
+        """EVERY raw API record carrying `value` — or an error that says which
+        of two very different causes applies.
+
+        A list, never a single record: an RRset can hold several API records
+        whose contents canonicalize to the same value (a raw TXT beside its
+        presentation-form twin, an uncompressed AAAA beside its compressed
+        spelling). Collapsing them to one record left the shadowed ones
+        unwritable — a delete removed only one carrier, and a split-TTL
+        normalization could issue zero writes and then ConvergenceError on
+        every run, because the record that needed the PATCH was the one the
+        index had discarded.
+        """
         if value in existing:
             return existing[value]
         if not existing:
@@ -448,10 +482,10 @@ class CloudflareProvider:
 
     def _apply_update(self, zone_id: str, update: RecordUpdate) -> None:
         want, have = update.desired, update.actual
-        existing = {
-            self._match_key(want.rtype, self._content(raw)): raw
-            for raw in self._api_records.get(want.key, [])
-        }
+        existing: dict[str, list[dict]] = {}
+        for raw in self._api_records.get(want.key, []):
+            existing.setdefault(self._match_key(want.rtype, self._content(raw)),
+                                []).append(raw)
         added = sorted(set(want.values) - set(have.values))
         removed = sorted(set(have.values) - set(want.values))
 
@@ -460,13 +494,15 @@ class CloudflareProvider:
         # 81053), so create-before-delete aborts on the POST, the DELETE never
         # runs, and the edge can never converge. Retarget in place instead —
         # atomic, so the name never resolves to nothing and never to both.
+        # (A single-valued type cannot carry same-canonical twins, so the
+        # value's record list holds exactly one entry here.)
         if want.rtype in _SINGLE_VALUE_TYPES:
             while added and removed:
                 old, new = removed.pop(0), added.pop(0)
-                raw = self._record(existing, old, want.key)
+                raw = self._records_for(existing, old, want.key)[0]
                 self._check_ttl(want)
                 self._request(
-                    "PATCH", f"/zones/{zone_id}/dns_records/{raw['id']}",
+                    "PATCH", self._record_path(zone_id, raw),
                     json=self._patch_body(want.rtype,
                                           content=self._wire_content(want.rtype, new),
                                           ttl=want.ttl))
@@ -476,12 +512,15 @@ class CloudflareProvider:
         # two over-serves (the RRset briefly carries both values) instead of
         # under-serving, which is the right trade for availability. Resolve the
         # ids to delete first, so an index miss fails before anything is
-        # written rather than after the create has already gone out.
-        doomed = [self._record(existing, value, want.key) for value in removed]
+        # written rather than after the create has already gone out. Every
+        # record carrying a removed value goes: deleting one of two carriers
+        # leaves the value still served and the post-apply re-fetch drifting.
+        doomed = [raw for value in removed
+                  for raw in self._records_for(existing, value, want.key)]
         for value in added:
             self._create(zone_id, want, value)
         for raw in doomed:
-            self._request("DELETE", f"/zones/{zone_id}/dns_records/{raw['id']}")
+            self._request("DELETE", self._record_path(zone_id, raw))
 
         # TTL lives on the API record, not the RRset, so the RRset-level
         # have.ttl can hide a record that disagrees. Decide per surviving
@@ -489,11 +528,11 @@ class CloudflareProvider:
         # A record still proxied is drift even at an equal TTL (its Auto TTL
         # of 1 may legitimately match desired), so it is PATCHed regardless.
         for value in sorted(set(want.values) & set(have.values)):
-            raw = self._record(existing, value, want.key)
-            if self._ttl_of(raw) != want.ttl or raw.get("proxied") is True:
-                self._check_ttl(want)
-                self._request("PATCH", f"/zones/{zone_id}/dns_records/{raw['id']}",
-                              json=self._patch_body(want.rtype, ttl=want.ttl))
+            for raw in self._records_for(existing, value, want.key):
+                if self._ttl_of(raw) != want.ttl or raw.get("proxied") is True:
+                    self._check_ttl(want)
+                    self._request("PATCH", self._record_path(zone_id, raw),
+                                  json=self._patch_body(want.rtype, ttl=want.ttl))
 
     def apply(self, diff: Diff) -> None:
         # Zone binding first, for every record in every branch: refusing after
@@ -521,4 +560,4 @@ class CloudflareProvider:
                     f"cloudflare API state error: no fetched records for {record.key}; "
                     f"apply() requires fetch_actual() in the same run")
             for raw in raws:
-                self._request("DELETE", f"/zones/{zone_id}/dns_records/{raw['id']}")
+                self._request("DELETE", self._record_path(zone_id, raw))

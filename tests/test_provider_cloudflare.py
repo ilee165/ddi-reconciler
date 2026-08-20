@@ -8,7 +8,7 @@ import responses
 from ddi_reconciler.config import EdgeConfig
 from ddi_reconciler.model import CanonicalRecord, Diff, RecordUpdate
 from ddi_reconciler.providers.cloudflare import CloudflareProvider
-from ddi_reconciler.runner import apply_edge, plan_edge
+from ddi_reconciler.runner import TypeConflictError, apply_edge, plan_edge
 
 API = "https://api.cloudflare.com/client/v4"
 Z = "example.com"
@@ -802,3 +802,80 @@ def test_an_invalid_update_ttl_also_blocks_the_whole_diff():
         provider.apply(Diff(to_add=[good],
                             to_update=[RecordUpdate(desired=want, actual=have)]))
     assert created.call_count == 0
+
+
+# --- 2026-08-20 review: same-canonical twins must not collapse ---------------
+
+@responses.activate
+def test_split_ttl_update_normalizes_every_same_canonical_record():
+    """Two API records whose contents canonicalize identically (a raw TXT
+    beside its presentation-form twin) used to collapse in _apply_update's
+    value index. When their TTLs were split, the forced normalize-update then
+    issued ZERO writes — the record needing the PATCH was the one the index
+    discarded — and the edge ended every run in ConvergenceError."""
+    register_zone()
+    register_records([
+        {"id": "r1", "type": "TXT", "name": "t.example.com", "content": "hello", "ttl": 600},
+        {"id": "r2", "type": "TXT", "name": "t.example.com", "content": "\"hello\"", "ttl": 300},
+    ])
+    provider = CloudflareProvider(Z, "token")
+    actual = provider.fetch_actual({Z})[0]
+    assert provider.split_ttl_keys == {(Z, "t", "TXT")}
+    patched = responses.patch(f"{API}/zones/zid/dns_records/r1",
+                              json={"success": True, "result": {}})
+    want = CanonicalRecord(zone=Z, name="t", rtype="TXT", values=("hello",), ttl=300)
+    provider.apply(Diff(to_update=[RecordUpdate(desired=want, actual=actual)]))
+    # r1 (ttl=600) is the record that drifts; r2 already serves 300 and any
+    # request to it would hit an unregistered mock and fail the test.
+    assert patched.call_count == 1
+
+
+@responses.activate
+def test_update_deletes_every_record_carrying_a_removed_value():
+    """Removing a value must remove all of its carriers: deleting one of two
+    same-canonical records leaves the value still served, and the post-apply
+    re-fetch ends in ConvergenceError."""
+    register_zone()
+    register_records([
+        {"id": "r1", "type": "TXT", "name": "t.example.com", "content": "hello", "ttl": 300},
+        {"id": "r2", "type": "TXT", "name": "t.example.com", "content": "\"hello\"", "ttl": 300},
+        {"id": "r3", "type": "TXT", "name": "t.example.com", "content": "keep", "ttl": 300},
+    ])
+    provider = CloudflareProvider(Z, "token")
+    actual = provider.fetch_actual({Z})[0]
+    d1 = responses.delete(f"{API}/zones/zid/dns_records/r1", json={"success": True, "result": {}})
+    d2 = responses.delete(f"{API}/zones/zid/dns_records/r2", json={"success": True, "result": {}})
+    want = CanonicalRecord(zone=Z, name="t", rtype="TXT", values=("keep",), ttl=300)
+    provider.apply(Diff(to_update=[RecordUpdate(desired=want, actual=actual)]))
+    assert d1.call_count == 1 and d2.call_count == 1
+
+
+# --- 2026-08-20 review: skipped records reach the runner's preflight ---------
+
+@responses.activate
+def test_runner_type_conflict_preflight_sees_skipped_records():
+    """A record this adapter cannot represent is still physically at the edge.
+    plan_edge consults `unparseable_keys`, so publishing skips only under this
+    adapter's own `skipped` name made them invisible to the CR-04 preflight: a
+    desired CNAME create at that owner reported as ordinary drift and then
+    failed on the POST (81053) after earlier writes had landed. It must refuse
+    up front instead — in dry-run too."""
+    register_zone()
+    register_records([
+        {"id": "x1", "type": "A", "name": "www.example.com",
+         "content": "not-an-ip", "ttl": 300, "proxied": False},
+    ])
+    edge = EdgeConfig(name="cf", provider="cloudflare", zone=Z,
+                      managed_keys=frozenset({(Z, "www", "CNAME")}))
+    provider = CloudflareProvider(Z, "token")  # no allowlist: skipped, not fatal
+    desired = [CanonicalRecord(zone=Z, name="www", rtype="CNAME",
+                               values=("target.example.com",), ttl=300)]
+    with pytest.raises(TypeConflictError, match="record-type conflict"):
+        plan_edge(edge, desired, provider, truth_complete=True)
+
+
+def test_record_path_escapes_server_supplied_ids():
+    """Ids are the server's data, not the operator's (the spatium adapter's
+    _segment rule): one carrying '/', '?' or '#' must not re-point a request."""
+    assert (CloudflareProvider._record_path("zid", {"id": "a/../b?x=1"})
+            == "/zones/zid/dns_records/a%2F..%2Fb%3Fx%3D1")
