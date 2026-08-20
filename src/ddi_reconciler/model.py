@@ -16,9 +16,16 @@ RecordKey: TypeAlias = tuple[str, str, str]
 SUPPORTED_RECORD_TYPES = frozenset({"A", "AAAA", "CNAME", "PTR", "TXT"})
 DOMAIN_VALUE_RECORD_TYPES = frozenset({"CNAME", "PTR"})
 
-# One DNS label: LDH plus underscore (_dmarc, _acme-challenge) plus a bare "*"
-# wildcard. Anchored, so anything else in a name is rejected outright.
-_LABEL = re.compile(r"^(?:\*|[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)$")
+# One DNS label: LDH plus underscore (_dmarc, _acme-challenge). Anchored, so
+# anything else in a name is rejected outright. The bare "*" wildcard is not
+# a label shape but a placement rule (leftmost only, RFC 4592), so it lives
+# in is_valid_dns_name rather than here.
+_LABEL = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
+
+# RFC 2181 §8: a TTL is an unsigned 32-bit value whose top bit must be clear.
+# Both edges also enforce (tighter) bounds of their own; this is the ceiling
+# above which no DNS server anywhere could accept the record.
+MAX_TTL = 2**31 - 1
 
 def _idna_label(label: str) -> str:
     """Punycode a non-ASCII label so a unicode name and the A-label the edge
@@ -46,7 +53,31 @@ def canonical_name(name: str) -> str:
     stores or compares a name must go through this, or a config zone and a
     record zone can be the same DNS name and two different strings."""
     stripped = name.strip().rstrip(".").lower()
-    return ".".join(_idna_label(label) for label in stripped.split("."))
+    joined = ".".join(_idna_label(label) for label in stripped.split("."))
+    # The IDNA codec maps the Unicode dot variants (U+3002/U+FF0E/U+FF61) to
+    # ASCII dots, so a trailing dot the first rstrip could not see can surface
+    # here. Strip again, or "example.com。" and "example.com" canonicalize to
+    # two identities and the function is not idempotent over its own output.
+    return joined.rstrip(".")
+
+
+def is_valid_dns_name(name: str, *, wildcard: bool = False) -> bool:
+    """Whether `name` (already in canonical form) is a DNS name the model can
+    represent: at most 253 octets, every label LDH-plus-underscore, and — only
+    with wildcard=True — a bare "*" permitted as the leftmost label (RFC 4592;
+    a wildcard anywhere else is not a wildcard, and neither edge serves it).
+
+    Shared with config.load_config, which must judge a managed key's name by
+    exactly this rule: a key name the model rejects can never match a record
+    on either side of the diff, so it would silently manage nothing.
+    """
+    if len(name) > 253:
+        return False
+    labels = name.split(".")
+    return all(
+        (label == "*" and wildcard and index == 0) or _LABEL.match(label)
+        for index, label in enumerate(labels)
+    )
 
 def canonical_record_key(zone: str, name: str, rtype: str) -> RecordKey:
     return (canonical_name(zone), canonical_name(name), rtype.strip().upper())
@@ -106,11 +137,19 @@ class CanonicalRecord:
         # path segment. Validate at the truth boundary so garbage from the
         # source of truth is named as such instead of surfacing as an opaque
         # "cloudflare API 400". "@" is the apex convention, not a DNS label.
-        if name != "@" and (len(name) > 253
-                            or not all(_LABEL.match(label) for label in name.split("."))):
+        # The length bound is on the full owner name — a relative name and a
+        # zone that are each legal can still concatenate past 253 octets.
+        if name != "@" and (not is_valid_dns_name(name, wildcard=True)
+                            or len(name) + 1 + len(zone) > 253):
             raise ValueError(f"invalid DNS name: {name!r}")
-        if isinstance(self.ttl, bool) or not isinstance(self.ttl, int) or self.ttl < 0:
-            raise ValueError("TTL must be a non-negative integer")
+        # The zone is interpolated into the same provider payloads, and a zone
+        # no edge can serve makes every record under it silently unmatchable.
+        if not is_valid_dns_name(zone):
+            raise ValueError(f"invalid DNS zone: {zone!r}")
+        if isinstance(self.ttl, bool) or not isinstance(self.ttl, int) \
+                or self.ttl < 0 or self.ttl > MAX_TTL:
+            raise ValueError(
+                f"TTL must be a non-negative integer no larger than {MAX_TTL} (RFC 2181)")
         if not self.values:
             raise ValueError("values must not be empty")
         if any(not isinstance(value, str) for value in self.values):
