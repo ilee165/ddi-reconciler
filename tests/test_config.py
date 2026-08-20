@@ -203,3 +203,43 @@ def test_an_empty_resource_group_is_config_error(tmp_path):
     path.write_text('[azure]\nresource_group = "  "\n' + EDGE_ONLY)
     with pytest.raises(ConfigError, match="resource_group.*non-empty string"):
         load_config(path)
+
+
+# --- 2026-08-20 review: a key name no record can have manages nothing --------
+
+@pytest.mark.parametrize("bad_name", ["app prod", "a..b", "-app", "a" * 64])
+def test_unmatchable_managed_key_names_are_rejected(tmp_path, bad_name):
+    """Every record in the diff is a CanonicalRecord whose name passed
+    is_valid_dns_name, so a key name the model rejects can never match a
+    desired or actual record: the key silently manages nothing, the CLI prints
+    SKIP for the record it was meant to own, and nightly drift stays green —
+    the same failure class the unsupported-record-type guard exists for."""
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace(
+        'managed_keys = [["azure.example.com", "APP.", "a"]]',
+        f'managed_keys = [["azure.example.com", "{bad_name}", "A"]]'))
+    with pytest.raises(ConfigError, match="manages nothing"):
+        load_config(path)
+
+
+def test_wildcard_and_apex_managed_key_names_stay_accepted(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace(
+        'managed_keys = [["azure.example.com", "APP.", "a"]]',
+        'managed_keys = [["azure.example.com", "@", "A"], '
+        '["azure.example.com", "*.wild", "A"]]'))
+    edge = load_config(path).edges[0]
+    assert edge.managed_keys == frozenset({("azure.example.com", "@", "A"),
+                                           ("azure.example.com", "*.wild", "A")})
+
+
+def test_unrepresentable_edge_zone_is_rejected(tmp_path):
+    """A zone the model rejects can never appear on a CanonicalRecord, so
+    every key under it would be inert — caught at load time instead."""
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace('zone = "Azure.Example.com."',
+                                  'zone = "azure..example.com"')
+                    .replace('managed_keys = [["azure.example.com", "APP.", "a"]]',
+                             'managed_keys = [["azure..example.com", "app", "A"]]'))
+    with pytest.raises(ConfigError, match="not a valid DNS name"):
+        load_config(path)

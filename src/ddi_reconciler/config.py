@@ -14,6 +14,7 @@ from ddi_reconciler.model import (
     RecordKey,
     canonical_name,
     canonical_record_key,
+    is_valid_dns_name,
 )
 
 
@@ -73,6 +74,12 @@ def load_config(path: Path) -> Config:
         provider = _require_str(entry, "provider")
         # Same canonicalizer the managed keys use, so the two agree exactly.
         zone = canonical_name(_require_str(entry, "zone"))
+        # A zone the model rejects can never appear on a CanonicalRecord, so
+        # every key under it would silently manage nothing (see the name check
+        # below for the full argument).
+        if not is_valid_dns_name(zone):
+            raise ConfigError(
+                f"edge {name!r}: zone {zone!r} is not a valid DNS name")
 
         raw_keys = entry.get("managed_keys")
         if not isinstance(raw_keys, list) or not raw_keys:
@@ -97,6 +104,21 @@ def load_config(path: Path) -> Config:
                 f"{unsupported}; supported types are {sorted(SUPPORTED_RECORD_TYPES)}. "
                 "An unsupported type manages nothing and would exit 0 having reconciled "
                 "nothing.")
+
+        # Same failure class on the name axis: every record in the diff is a
+        # CanonicalRecord, whose name passed is_valid_dns_name — so a key name
+        # the model rejects ("app prod", "a..b", a 64-char label) can never
+        # match a desired or actual record. The key would silently manage
+        # nothing while nightly drift stays green, exactly like a typo'd type.
+        bad_names = sorted(
+            key for key in managed_keys
+            if key[1] != "@" and (not is_valid_dns_name(key[1], wildcard=True)
+                                  or len(key[1]) + 1 + len(key[0]) > 253))
+        if bad_names:
+            raise ConfigError(
+                f"edge {name!r}: managed_keys carry name(s) that are not valid DNS "
+                f"names: {bad_names}. A key whose name no record can ever have "
+                "manages nothing and would exit 0 having reconciled nothing.")
 
         if provider not in {"azure", "cloudflare"}:
             raise ConfigError(f"unknown provider {provider!r} for edge {name!r}")
