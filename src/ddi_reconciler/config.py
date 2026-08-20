@@ -120,6 +120,24 @@ def load_config(path: Path) -> Config:
                 f"names: {bad_names}. A key whose name no record can ever have "
                 "manages nothing and would exit 0 having reconciled nothing.")
 
+        # A key name written as an absolute FQDN is a VALID DNS name that
+        # still matches nothing: every adapter stores record names
+        # zone-relative ("@", "app", "*"), so ["example.com",
+        # "app.example.com", "A"] could only ever match the pathological
+        # owner app.example.com.example.com. runner's OwnershipError already
+        # refuses this FQDN-where-relative-belongs mistake on the
+        # desired-record side ("the common snapshot mistake"); refuse its
+        # mirror on the key side too.
+        fqdn_shaped = sorted(
+            key for key in managed_keys
+            if key[1] == zone or key[1].endswith("." + zone))
+        if fqdn_shaped:
+            raise ConfigError(
+                f"edge {name!r}: managed_keys carry FQDN-shaped name(s) "
+                f"{fqdn_shaped}. Record names are zone-relative: write the apex as "
+                f"'@', and 'app.{zone}' as 'app'. An FQDN-shaped key manages "
+                "nothing and would exit 0 having reconciled nothing.")
+
         if provider not in {"azure", "cloudflare"}:
             raise ConfigError(f"unknown provider {provider!r} for edge {name!r}")
         # An edge may only own keys in its own zone. Caught here rather than

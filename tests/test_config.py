@@ -243,3 +243,22 @@ def test_unrepresentable_edge_zone_is_rejected(tmp_path):
                              'managed_keys = [["azure..example.com", "app", "A"]]'))
     with pytest.raises(ConfigError, match="not a valid DNS name"):
         load_config(path)
+
+
+@pytest.mark.parametrize("fqdn_name", [
+    "azure.example.com",          # apex spelled as the zone (means "@")
+    "app.azure.example.com",      # relative name spelled absolute
+    "*.azure.example.com",        # wildcard spelled absolute
+])
+def test_fqdn_shaped_managed_key_names_are_rejected(tmp_path, fqdn_name):
+    """A valid DNS name that still matches nothing: every adapter stores
+    record names zone-relative ('@', 'app', '*'), so an FQDN-shaped key
+    manages nothing and drift stays green — the mirror of runner's
+    OwnershipError, which refuses the same FQDN-where-relative-belongs
+    mistake on the desired-record side."""
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace(
+        'managed_keys = [["azure.example.com", "APP.", "a"]]',
+        f'managed_keys = [["azure.example.com", "{fqdn_name}", "A"]]'))
+    with pytest.raises(ConfigError, match="FQDN-shaped"):
+        load_config(path)
