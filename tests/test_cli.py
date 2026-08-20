@@ -351,8 +351,9 @@ def test_unproven_deletions_pass_with_the_explicit_opt_in(pair_files, monkeypatc
 
 
 def test_the_drift_workflow_invocation_reaches_no_opt_in_flag(pair_files, monkeypatch):
-    """.github/workflows/drift.yml runs `--dry-run --desired-from-file <snap>`
-    and nothing else, so neither override can be reached from CI."""
+    """A scheduled drift job runs `--dry-run --desired-from-file <snap>` and
+    nothing else (see the README's exit-code contract and
+    scripts/check-drift-exit.sh), so neither override can be reached from CI."""
     config, desired = pair_files
     desired.write_text(json.dumps([APP]))
     provider = FakeProvider([record("app"), record("db", "192.0.2.30")])
@@ -725,3 +726,31 @@ def test_dry_run_type_conflict_exits_1_with_manual_transition_guidance(
     assert "record-type conflict" in err
     assert "manual, two-session procedure" in err
     assert "Traceback" not in err
+
+
+# --- 2026-08-20 review: reporting failure is not partial mutation ------------
+
+def test_reporting_failure_after_a_verified_apply_is_not_partial_mutation(
+        files, monkeypatch, capsys):
+    """An OSError while printing an edge's own report (broken pipe from
+    `--apply | head`, disk full) lands AFTER apply_edge proved convergence.
+    The partial-apply account used to still carry the edge in `mutating` and
+    told the operator it "may be partially mutated" with "edge(s) fully
+    applied before it: none" — a hunt for damage that provably cannot exist."""
+    config, desired = files
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "_build_providers",
+                        lambda cfg, edges=None: {"azure-private": provider})
+
+    def boom(*args, **kwargs):
+        raise OSError("broken pipe")
+
+    monkeypatch.setattr(cli, "_print_diff", boom)
+    code = cli.main(["--apply", "--config", str(config),
+                     "--desired-from-file", str(desired)])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert provider.applied
+    assert "may be partially mutated" not in err
+    assert "applied and verified convergence" in err
+    assert "azure-private" in err

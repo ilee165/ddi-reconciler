@@ -209,14 +209,22 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: [{edge.name}] {exc}", file=sys.stderr)
                 unchecked.append(edge.name)
                 continue
-            _print_diff(edge.name, result.diff, result.dropped_desired,
-                        result.split_ttl_keys, result.proxied_keys)
+            # The call above returned, so for --apply the write landed AND the
+            # re-plan proved convergence: this edge can no longer be partially
+            # mutated. Settle the account before printing anything about it —
+            # an OSError while reporting (broken pipe, disk full) must be
+            # attributed to reporting, not read as possible damage at an edge
+            # that provably completed (see _report_partial_apply).
             changes = (len(result.diff.to_add) + len(result.diff.to_update)
                        + len(result.diff.to_delete))
             if args.apply and changes:
+                applied.append(edge.name)
+            mutating.clear()
+            _print_diff(edge.name, result.diff, result.dropped_desired,
+                        result.split_ttl_keys, result.proxied_keys)
+            if args.apply and changes:
                 # Per-edge account, printed as each edge completes: a failure
                 # later in the loop must not hide what already landed.
-                applied.append(edge.name)
                 print(f"[{edge.name}] applied {changes} change(s)")
             adds += len(result.diff.to_add)
             updates += len(result.diff.to_update)
@@ -265,6 +273,12 @@ def _report_partial_apply(args: argparse.Namespace, current: str | None,
     if mutating:
         print(f"error: edge {current!r} did not complete and may be partially mutated; "
               f"edge(s) fully applied before it: {done}", file=sys.stderr)
+    elif current in applied:
+        # The edge applied AND its re-plan proved convergence; the failure
+        # happened while reporting it. There is no damage to hunt for.
+        print(f"error: edge {current!r} applied and verified convergence; the failure "
+              f"happened while reporting it. Edge(s) fully applied: {done}",
+              file=sys.stderr)
     elif applied:
         print(f"error: edge {current!r} failed before writing anything, so nothing at that "
               f"edge changed; edge(s) fully applied before it: {done}", file=sys.stderr)
