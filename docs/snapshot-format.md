@@ -49,7 +49,7 @@ A snapshot is a JSON envelope with this structure:
 - **`records`** (array): List of DNS records. Each record has:
   - `zone` (string): The zone this record belongs to.
   - `name` (string): The record name.
-  - `rtype` (string): The record type (e.g., `A`, `AAAA`, `CNAME`, `MX`, `TXT`).
+  - `rtype` (string): The record type — one of the supported types `A`, `AAAA`, `CNAME`, `PTR`, `TXT`. A snapshot carrying any other type fails to load.
   - `values` (array of strings): The record values (IPs, targets, etc.).
   - `ttl` (integer): Time-to-live in seconds.
 
