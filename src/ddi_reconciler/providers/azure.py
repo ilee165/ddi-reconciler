@@ -61,6 +61,11 @@ from ddi_reconciler.model import (
     canonical_record_key,
 )
 
+# Azure Private DNS accepts TTLs of 1..2^31-1 and rejects anything else with a
+# 400 that never names TTL as the cause. The model's own floor is 0 (a legal
+# DNS TTL), so the provider bound has to be enforced here.
+_TTL_MIN, _TTL_MAX = 1, 2**31 - 1
+
 
 class AzureProvider:
     def __init__(self, subscription_id: str, resource_group: str, client=None):
@@ -233,6 +238,13 @@ class AzureProvider:
                 "azure API error: refusing to write managed record set(s) that could not be "
                 f"read at the edge, so the diff for them is not trustworthy — {detail}")
 
+    @staticmethod
+    def _check_ttl(record: CanonicalRecord) -> None:
+        if not (_TTL_MIN <= record.ttl <= _TTL_MAX):
+            raise RuntimeError(
+                f"azure rejects ttl={record.ttl} for {'/'.join(record.key)}: use "
+                f"{_TTL_MIN}-{_TTL_MAX}")
+
     def _require_etag(self, record: CanonicalRecord) -> str:
         etag = self._etags.get(record.key)
         if not etag:
@@ -245,6 +257,11 @@ class AzureProvider:
 
     def apply(self, diff: Diff) -> None:
         self._guard([*diff.to_add, *(u.desired for u in diff.to_update), *diff.to_delete])
+        # TTL preflight across the whole diff (same principle and placement as
+        # the Cloudflare adapter's WR-03): a per-op 400 would land only after
+        # earlier writes had already gone out, leaving avoidable partial state.
+        for record in (*diff.to_add, *(u.desired for u in diff.to_update)):
+            self._check_ttl(record)
         # Resolve every ETag before the first call, for the same reason
         # _guard() vets every record first: all-or-nothing, or the writes
         # ordered ahead of the refused one land anyway.
