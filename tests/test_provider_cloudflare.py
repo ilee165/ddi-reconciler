@@ -879,3 +879,40 @@ def test_record_path_escapes_server_supplied_ids():
     _segment rule): one carrying '/', '?' or '#' must not re-point a request."""
     assert (CloudflareProvider._record_path("zid", {"id": "a/../b?x=1"})
             == "/zones/zid/dns_records/a%2F..%2Fb%3Fx%3D1")
+
+
+@responses.activate
+def test_preflight_sees_unsupported_type_records_at_the_owner():
+    """An MX at the owner name is invisible to the model but not to
+    Cloudflare: a desired CNAME create beside it dies on the POST with 81053.
+    Recording unsupported-type records in skipped lets the CR-04 preflight
+    refuse it up front — in dry-run too."""
+    register_zone()
+    register_records([
+        {"id": "m1", "type": "MX", "name": "www.example.com",
+         "content": "mail.x", "ttl": 300},
+    ])
+    edge = EdgeConfig(name="cf", provider="cloudflare", zone=Z,
+                      managed_keys=frozenset({(Z, "www", "CNAME")}))
+    provider = CloudflareProvider(Z, "token")
+    desired = [CanonicalRecord(zone=Z, name="www", rtype="CNAME",
+                               values=("target.example.com",), ttl=300)]
+    with pytest.raises(TypeConflictError, match="record-type conflict"):
+        plan_edge(edge, desired, provider, truth_complete=True)
+
+
+@responses.activate
+def test_a_create_beside_an_unsupported_type_is_not_a_conflict():
+    """Only CNAME cannot coexist; an A create beside an MX is ordinary."""
+    register_zone()
+    register_records([
+        {"id": "m1", "type": "MX", "name": "www.example.com",
+         "content": "mail.x", "ttl": 300},
+    ])
+    edge = EdgeConfig(name="cf", provider="cloudflare", zone=Z,
+                      managed_keys=frozenset({(Z, "www", "A")}))
+    provider = CloudflareProvider(Z, "token")
+    desired = [CanonicalRecord(zone=Z, name="www", rtype="A",
+                               values=("192.0.2.1",), ttl=300)]
+    result = plan_edge(edge, desired, provider, truth_complete=True)
+    assert [r.key for r in result.diff.to_add] == [(Z, "www", "A")]

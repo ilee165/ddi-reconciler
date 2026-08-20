@@ -389,9 +389,15 @@ class CloudflareProvider:
                 raise RuntimeError(
                     f"cloudflare API error: malformed dns_record payload: {raw!r}")
             rtype = str(raw["type"]).upper()
-            if rtype not in SUPPORTED_RECORD_TYPES:
-                continue
             key = (self.zone_name, self._relative(str(raw["name"])), rtype)
+            if rtype not in SUPPORTED_RECORD_TYPES:
+                # Not representable, but physically present — record it (no
+                # warning: MX/SRV/CAA are normal zone furniture) so the
+                # runner's CR-04 preflight sees the owner name as occupied. A
+                # desired CNAME create beside an MX must refuse up front, not
+                # fail on the POST with 81053 after earlier writes landed.
+                self.skipped.append((key, f"unsupported record type {rtype}"))
+                continue
             if rtype in _PROXIABLE_TYPES:
                 # CR-04: DNS-only policy cannot be enforced blind. A proxiable
                 # record without a boolean `proxied` is an API contract break,

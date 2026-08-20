@@ -124,9 +124,19 @@ class AzureProvider:
                     raise RuntimeError(
                         f"azure API error listing {zone}: record set is missing "
                         f"name/type/ttl ({exc})") from exc
-                if rtype not in SUPPORTED_RECORD_TYPES:
-                    continue
                 key = canonical_record_key(zone_key, name, rtype)
+                if rtype not in SUPPORTED_RECORD_TYPES:
+                    # Not representable, but physically present (SOA and NS
+                    # exist in every zone) — record it silently so the
+                    # runner's CR-04 preflight sees the owner name as
+                    # occupied: a desired CNAME create there can never be
+                    # applied, because Azure rejects a CNAME PUT beside any
+                    # existing type. An unsupported type can never be a
+                    # managed key (config refuses those), so this entry can
+                    # only ever feed the observed-keys set, not a refusal.
+                    self.unparseable_keys.setdefault(
+                        key, f"unsupported record type {rtype}")
+                    continue
                 # Fail closed: only an explicit False is "manual, safe to write".
                 if getattr(rs, "is_auto_registered", None) is not False:
                     self.blocked_keys.add(key)
