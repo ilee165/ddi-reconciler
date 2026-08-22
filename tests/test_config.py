@@ -203,3 +203,170 @@ def test_an_empty_resource_group_is_config_error(tmp_path):
     path.write_text('[azure]\nresource_group = "  "\n' + EDGE_ONLY)
     with pytest.raises(ConfigError, match="resource_group.*non-empty string"):
         load_config(path)
+
+
+# --- 2026-08-20 review: a key name no record can have manages nothing --------
+
+@pytest.mark.parametrize("bad_name", ["app prod", "a..b", "-app", "a" * 64])
+def test_unmatchable_managed_key_names_are_rejected(tmp_path, bad_name):
+    """Every record in the diff is a CanonicalRecord whose name passed
+    is_valid_dns_name, so a key name the model rejects can never match a
+    desired or actual record: the key silently manages nothing, the CLI prints
+    SKIP for the record it was meant to own, and nightly drift stays green —
+    the same failure class the unsupported-record-type guard exists for."""
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace(
+        'managed_keys = [["azure.example.com", "APP.", "a"]]',
+        f'managed_keys = [["azure.example.com", "{bad_name}", "A"]]'))
+    with pytest.raises(ConfigError, match="manages nothing"):
+        load_config(path)
+
+
+def test_wildcard_and_apex_managed_key_names_stay_accepted(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace(
+        'managed_keys = [["azure.example.com", "APP.", "a"]]',
+        'managed_keys = [["azure.example.com", "@", "A"], '
+        '["azure.example.com", "*.wild", "A"]]'))
+    edge = load_config(path).edges[0]
+    assert edge.managed_keys == frozenset({("azure.example.com", "@", "A"),
+                                           ("azure.example.com", "*.wild", "A")})
+
+
+def test_unrepresentable_edge_zone_is_rejected(tmp_path):
+    """A zone the model rejects can never appear on a CanonicalRecord, so
+    every key under it would be inert — caught at load time instead."""
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace('zone = "Azure.Example.com."',
+                                  'zone = "azure..example.com"')
+                    .replace('managed_keys = [["azure.example.com", "APP.", "a"]]',
+                             'managed_keys = [["azure..example.com", "app", "A"]]'))
+    with pytest.raises(ConfigError, match="not a valid DNS name"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("fqdn_name", [
+    "azure.example.com",          # apex spelled as the zone (means "@")
+    "app.azure.example.com",      # relative name spelled absolute
+    "*.azure.example.com",        # wildcard spelled absolute
+])
+def test_fqdn_shaped_managed_key_names_are_rejected(tmp_path, fqdn_name):
+    """A valid DNS name that still matches nothing: every adapter stores
+    record names zone-relative ('@', 'app', '*'), so an FQDN-shaped key
+    manages nothing and drift stays green — the mirror of runner's
+    OwnershipError, which refuses the same FQDN-where-relative-belongs
+    mistake on the desired-record side."""
+    path = tmp_path / "config.toml"
+    path.write_text(VALID.replace(
+        'managed_keys = [["azure.example.com", "APP.", "a"]]',
+        f'managed_keys = [["azure.example.com", "{fqdn_name}", "A"]]'))
+    with pytest.raises(ConfigError, match="FQDN-shaped"):
+        load_config(path)
+
+
+# --- [[sources]]: federated truth --------------------------------------------
+
+SN_SOURCE = """
+[[sources]]
+name = "sn-servers"
+type = "servicenow"
+base_url = "https://example.service-now.com"
+zones = ["azure.example.com"]
+table = "cmdb_ci_server"
+name_field = "host_name"
+value_field = "ip_address"
+rtype = "a"
+"""
+
+
+def test_sources_parse_with_defaults(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE)
+    source = load_config(path).sources[0]
+    assert source.name == "sn-servers"
+    assert source.type == "servicenow"
+    assert source.zones == ("azure.example.com",)
+    assert source.rtype == "A"      # normalized like managed-key types
+    assert source.ttl == 300 and source.query == ""
+
+
+def test_no_sources_means_the_classic_single_source_config(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID)
+    assert load_config(path).sources == ()
+
+
+def test_a_spatium_source_inherits_the_spatium_base_url(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + """
+[[sources]]
+name = "ddi"
+type = "spatium"
+zones = ["azure.example.com"]
+""")
+    assert load_config(path).sources[0].base_url == "http://spatium.test:8000/"
+
+
+def test_an_unknown_source_type_is_rejected(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE.replace('type = "servicenow"',
+                                              'type = "netbox"'))
+    with pytest.raises(ConfigError, match="unknown type 'netbox'"):
+        load_config(path)
+
+
+def test_duplicate_source_names_are_rejected(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE + SN_SOURCE)
+    with pytest.raises(ConfigError, match="duplicate source name"):
+        load_config(path)
+
+
+def test_a_servicenow_source_missing_its_mapping_is_rejected(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE.replace(
+        'table = "cmdb_ci_server"\n', ''))
+    with pytest.raises(ConfigError, match="'table' must be a non-empty string"):
+        load_config(path)
+
+
+def test_an_unsupported_source_rtype_is_rejected(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE.replace('rtype = "a"', 'rtype = "MX"'))
+    with pytest.raises(ConfigError, match="not a supported record type"):
+        load_config(path)
+
+
+def test_source_zones_must_be_representable(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE.replace(
+        'zones = ["azure.example.com"]', 'zones = ["bad zone.com"]'))
+    with pytest.raises(ConfigError, match="not valid DNS names"):
+        load_config(path)
+
+
+def test_source_zones_must_be_a_non_empty_list(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE.replace(
+        'zones = ["azure.example.com"]', 'zones = []'))
+    with pytest.raises(ConfigError, match="non-empty list of zone names"):
+        load_config(path)
+
+
+def test_a_wrong_typed_source_ttl_is_rejected(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + SN_SOURCE + 'ttl = true\n')
+    with pytest.raises(ConfigError, match="'ttl' must be an integer"):
+        load_config(path)
+
+
+def test_a_snapshot_source_requires_a_path(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(VALID + """
+[[sources]]
+name = "team-b"
+type = "snapshot"
+zones = ["azure.example.com"]
+""")
+    with pytest.raises(ConfigError, match="'path' must be a non-empty string"):
+        load_config(path)

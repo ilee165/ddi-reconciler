@@ -728,3 +728,74 @@ def test_a_malformed_page_size_under_a_valid_pages_branch_still_taints():
     provider = SpatiumProvider(BASE, token="t")
     provider.fetch_desired({"test.zone"})
     assert provider.read_verified is False
+
+
+# --- 2026-08-20 review: echo the deployment's own pagination keys ------------
+
+@responses.activate
+def test_offset_pagination_echoes_the_deployments_own_keys():
+    """A deployment paginating with skip/limit — names this adapter itself
+    recognizes in OFFSET_KEYS/LIMIT_KEYS — used to be sent 'offset'/'limit'
+    back: parameter names the server ignores, so it served page 1 again and
+    every walk died on the duplicate-item check. The echoed parameters must
+    use the keys the deployment declared (the _FieldLookup rationale)."""
+    one_group_one_zone()
+    data = [rec(f"h{i}", f"10.0.0.{i}") for i in range(4)]
+
+    def records(request):
+        import json as _json
+        from urllib.parse import parse_qs, urlsplit
+        query = parse_qs(urlsplit(request.url).query)
+        skip = int(query.get("skip", ["0"])[0])  # the server reads ONLY skip
+        return (200, {}, _json.dumps(
+            {"items": data[skip:skip + 2], "total": 4, "skip": skip, "limit": 2}))
+
+    responses.add_callback(responses.GET, RECORDS, callback=records)
+    provider = SpatiumProvider(BASE, token="t")
+    records_out = provider.fetch_desired({"test.zone"})
+    assert sorted(r.name for r in records_out) == ["h0", "h1", "h2", "h3"]
+    assert provider.read_verified is True
+
+
+@responses.activate
+def test_page_number_pagination_echoes_the_declared_key():
+    """Same rule on the page-numbered branch: a deployment declaring
+    page_number must be asked for page_number=2, not page=2."""
+    one_group_one_zone()
+    data = [rec(f"h{i}", f"10.0.0.{i}") for i in range(4)]
+
+    def records(request):
+        import json as _json
+        from urllib.parse import parse_qs, urlsplit
+        query = parse_qs(urlsplit(request.url).query)
+        number = int(query.get("page_number", ["1"])[0])
+        start = (number - 1) * 2
+        return (200, {}, _json.dumps(
+            {"items": data[start:start + 2], "total": 4, "page_number": number}))
+
+    responses.add_callback(responses.GET, RECORDS, callback=records)
+    provider = SpatiumProvider(BASE, token="t")
+    records_out = provider.fetch_desired({"test.zone"})
+    assert sorted(r.name for r in records_out) == ["h0", "h1", "h2", "h3"]
+    assert provider.read_verified is True
+
+
+# --- 2026-08-20 review: read_verified fails closed through a failed fetch ----
+
+@responses.activate
+def test_a_failed_fetch_leaves_read_verified_false():
+    """read_verified is deletion authority (TruthSource contract). It used to
+    be set True at the top of fetch_desired, so a fetch that died mid-walk
+    left the provider asserting a verified read — and a caller that caught the
+    error inherited deletion authority from a read that never completed. The
+    flag may take the walk's verdict only once the fetch has returned."""
+    one_group_one_zone()
+    responses.get(RECORDS, json=page([rec("app")]))
+    provider = SpatiumProvider(BASE, token="t")
+    assert provider.fetch_desired({"test.zone"}) and provider.read_verified is True
+
+    responses.reset()
+    responses.get(GROUPS, status=500)
+    with pytest.raises(RuntimeError, match="spatium API error"):
+        provider.fetch_desired({"test.zone"})
+    assert provider.read_verified is False  # the earlier True must not survive

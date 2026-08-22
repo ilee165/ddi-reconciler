@@ -7,7 +7,12 @@ from azure.core import MatchConditions
 from ddi_reconciler.config import EdgeConfig
 from ddi_reconciler.model import CanonicalRecord, Diff, RecordUpdate
 from ddi_reconciler.providers.azure import AzureProvider
-from ddi_reconciler.runner import UnwritableKeyError, apply_edge, plan_edge
+from ddi_reconciler.runner import (
+    TypeConflictError,
+    UnwritableKeyError,
+    apply_edge,
+    plan_edge,
+)
 
 Z = "azure.example.com"
 
@@ -475,3 +480,57 @@ def test_plan_edge_refuses_an_empty_managed_record_set_with_the_real_cause():
     desired = [CanonicalRecord(zone=Z, name="app", rtype="A", values=("192.0.2.40",))]
     with pytest.raises(UnwritableKeyError, match="carries no values"):
         plan_edge(edge, desired, provider)
+
+
+# --- 2026-08-20 review: TTL preflight across the whole diff ------------------
+
+def test_apply_preflights_ttl_across_the_whole_diff():
+    """Same principle and placement as the Cloudflare adapter's WR-03: Azure
+    rejects ttl=0 with a 400 that names nothing, and a per-op failure would
+    land only after earlier writes had gone out — the partial state the
+    README's preflight promise exists to prevent. The whole diff is vetted
+    before the first call."""
+    provider, client = make_provider([])
+    provider.fetch_actual({Z})
+    ok = CanonicalRecord(zone=Z, name="app", rtype="A", values=("192.0.2.40",), ttl=300)
+    bad = CanonicalRecord(zone=Z, name="db", rtype="A", values=("192.0.2.30",), ttl=0)
+    with pytest.raises(RuntimeError, match="azure rejects ttl=0"):
+        provider.apply(Diff(to_add=[ok, bad]))
+    assert client.record_sets.upserts == []  # nothing wrote before the refusal
+
+
+def test_apply_accepts_the_full_azure_ttl_range():
+    provider, client = make_provider([])
+    provider.fetch_actual({Z})
+    lo = CanonicalRecord(zone=Z, name="lo", rtype="A", values=("192.0.2.1",), ttl=1)
+    hi = CanonicalRecord(zone=Z, name="hi", rtype="A", values=("192.0.2.2",),
+                         ttl=2**31 - 1)
+    provider.apply(Diff(to_add=[lo, hi]))
+    assert len(client.record_sets.upserts) == 2
+
+
+# --- 2026-08-20 review: unsupported types occupy their owner name ------------
+
+def test_preflight_sees_unsupported_type_record_sets():
+    """SOA exists at every apex, and Azure rejects a CNAME PUT beside any
+    existing type — so a desired apex CNAME can never be applied. The CR-04
+    preflight must see the unsupported-type record set as occupying the owner
+    and refuse up front, not fail on the PUT."""
+    edge = EdgeConfig(name="az", provider="azure", zone=Z,
+                      managed_keys=frozenset({(Z, "@", "CNAME")}))
+    provider, _ = make_provider([record_set("@", "SOA")])
+    desired = [CanonicalRecord(zone=Z, name="@", rtype="CNAME",
+                               values=("target.example.com",), ttl=300)]
+    with pytest.raises(TypeConflictError, match="record-type conflict"):
+        plan_edge(edge, desired, provider, truth_complete=True)
+
+
+def test_a_create_beside_an_unsupported_type_is_not_a_conflict():
+    """Only CNAME cannot coexist; an A create beside SOA/MX is ordinary."""
+    edge = EdgeConfig(name="az", provider="azure", zone=Z,
+                      managed_keys=frozenset({(Z, "@", "A")}))
+    provider, _ = make_provider([record_set("@", "SOA")])
+    desired = [CanonicalRecord(zone=Z, name="@", rtype="A",
+                               values=("192.0.2.1",), ttl=300)]
+    result = plan_edge(edge, desired, provider, truth_complete=True)
+    assert [r.key for r in result.diff.to_add] == [(Z, "@", "A")]

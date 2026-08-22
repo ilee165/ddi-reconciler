@@ -54,7 +54,7 @@ class UnwritableKeyError(RuntimeError):
 class TypeConflictError(RuntimeError):
     """A record-type transition (or CNAME coexistence) that cannot converge.
 
-    REVIEW.md CR-04: DNS forbids a CNAME beside any other type at one owner
+    review finding CR-04: DNS forbids a CNAME beside any other type at one owner
     name, and both providers enforce it — Cloudflare rejects the POST with
     81053, Azure rejects the PUT. Record identity includes the type, so a
     CNAME→A change is an ADD of one key plus a DELETE of another, and

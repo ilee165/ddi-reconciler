@@ -46,7 +46,7 @@ from ddi_reconciler.model import CanonicalRecord
 
 _REQUIRED_FIELDS = ("zone", "name", "rtype", "values", "ttl")
 _STRING_FIELDS = ("zone", "name", "rtype")
-# v2 (REVIEW.md CR-01): the checksum binds version + truth_verified + count +
+# v2 (review finding CR-01): the checksum binds version + truth_verified + count +
 # records, so the deletion-authority flag can no longer be flipped on a
 # checksum-clean file. v1 snapshots (records-only hash) are hard-rejected by
 # the version check with a "re-export it" message — migration is a re-export
@@ -88,7 +88,7 @@ def _payload(records: list[CanonicalRecord]) -> list[dict]:
 
 def _checksum(payload: list[dict], *, truth_verified: bool) -> str:
     """Content hash binding the records array AND the fields that give it
-    authority (REVIEW.md CR-01).
+    authority (review finding CR-01).
 
     v1 hashed the records alone, so flipping `truth_verified` from false to
     true left a checksum-clean file — and that flag is precisely what

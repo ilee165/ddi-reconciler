@@ -10,7 +10,7 @@ octoDNS and DNSControl are mature, general-purpose DNS-as-code tools with broad 
 
 - **Truth-verified snapshots.** Before the reconciler is allowed to delete anything, it has to prove its read of the source of truth was complete. A snapshot that can't prove completeness (a truncated export, a hand-edited file, an API response that didn't declare a total) is marked unverified, and unverified snapshots can drive adds and updates but never deletions.
 - **Azure Private DNS as a first-class target.** Split-horizon setups — an internal, private-DNS view of a zone alongside a public one — are a primary use case here, not an afterthought bolted onto a public-DNS-first model.
-- **The whole suite runs offline with zero credentials.** All 418 tests run without network access or any API token, against fakes that model the real provider APIs' failure modes.
+- **The whole suite runs offline with zero credentials.** Every test runs without network access or any API token, against fakes that model the real provider APIs' failure modes.
 
 ## Safety model
 
@@ -18,7 +18,7 @@ octoDNS and DNSControl are mature, general-purpose DNS-as-code tools with broad 
 - **Snapshot checksum + `truth_verified` envelope.** Exported snapshots (`desired-records.json`) carry a `version`, a `truth_verified` flag, a record `count`, and a SHA256 checksum binding all of it together. A mismatched checksum — from truncation, a merge conflict, or a hand-edit — is a fatal error. See [`docs/snapshot-format.md`](docs/snapshot-format.md) for the full format.
 - **Unverified snapshots block deletions.** If the read behind a snapshot (or the live SpatiumDDI API) can't be proven complete, `truth_verified` is `false` and the reconciler refuses to delete records even if they only exist on the edge. Adds and updates still proceed.
 - **TTL preflight across the whole diff before any write.** Every record's TTL is validated against the provider's accepted range before the first API call goes out, so a diff with one valid record and one invalid one fails cleanly instead of partially applying and then erroring out.
-- **Exit-code contract: `0` converged, `1` operational error, `2` drift.** `--dry-run` exits `2` when it finds drift and `0` when everything already matches; any run that couldn't complete (bad config, unreachable API, partial write) exits `1`. This is built for cron/CI drift jobs: alert on `2`, page on `1`, stay quiet on `0`.
+- **Exit-code contract: `0` converged, `1` operational error, `2` drift.** `--dry-run` exits `2` when it finds drift and `0` when everything already matches; any run that couldn't complete (bad config, unreachable API, partial write) exits `1`. This is built for cron/CI drift jobs: alert on `2`, page on `1`, stay quiet on `0`. A scheduled drift job lives with your deployment (it needs your config, snapshot, and credentials, so it is not a workflow in this repo); wire its gate through [`scripts/check-drift-exit.sh`](scripts/check-drift-exit.sh), which accepts only the two ran-to-completion codes and fails closed on everything else — a missing tool (127) or an OOM kill (137) must not leave the schedule green and silent.
 
 ## Quickstart
 
@@ -89,6 +89,16 @@ options:
 ```
 
 `--dry-run` and `--apply` are mutually exclusive with `--export`; pick one mode per run.
+
+## Federated truth: gathering desired state from several systems of record
+
+Different teams keep inventory in different places — SpatiumDDI, a ServiceNow CMDB, their own exporter. Optional `[[sources]]` entries in `config.toml` declare one truth source each, together with the zones it is authoritative for; a run merges every relevant source into one desired set, and `--export` writes that merged, checksummed snapshot — all information in one place. Three source types ship:
+
+- **`spatium`** — the classic truth API, now scopeable to specific zones.
+- **`servicenow`** — desired records *derived* from one CMDB table via a field mapping (`table`, `name_field`, `value_field`, `rtype`); auth comes from `SERVICENOW_TOKEN` or `SERVICENOW_USERNAME`/`SERVICENOW_PASSWORD` in the environment. Reads are verified against the instance's declared `X-Total-Count`; a row whose mapped fields are empty derives nothing (and is counted on stderr), while a row carrying data the model rejects is a hard error — dropping it would read as a delete order for its key.
+- **`snapshot`** — a committed file in the [snapshot format](docs/snapshot-format.md), so a team can participate by just publishing a checksummed export from whatever tooling they already have.
+
+The merge rules are ownership rules, and every violation is loud: a source may not return records outside its declared zones, two sources carrying the same record key is a hard error even when they agree, every selected edge zone must be covered by some source, and the merged read is `truth_verified` only when every consulted source's read is. `--edge` still keeps runs cheap — a source whose zones the run doesn't touch is neither queried nor asked for credentials. See `config.example.toml` for the full shape; with no `[[sources]]` declared, behavior is unchanged (SpatiumDDI covers every edge zone).
 
 ## Writing your own provider
 

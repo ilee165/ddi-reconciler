@@ -351,8 +351,9 @@ def test_unproven_deletions_pass_with_the_explicit_opt_in(pair_files, monkeypatc
 
 
 def test_the_drift_workflow_invocation_reaches_no_opt_in_flag(pair_files, monkeypatch):
-    """.github/workflows/drift.yml runs `--dry-run --desired-from-file <snap>`
-    and nothing else, so neither override can be reached from CI."""
+    """A scheduled drift job runs `--dry-run --desired-from-file <snap>` and
+    nothing else (see the README's exit-code contract and
+    scripts/check-drift-exit.sh), so neither override can be reached from CI."""
     config, desired = pair_files
     desired.write_text(json.dumps([APP]))
     provider = FakeProvider([record("app"), record("db", "192.0.2.30")])
@@ -725,3 +726,177 @@ def test_dry_run_type_conflict_exits_1_with_manual_transition_guidance(
     assert "record-type conflict" in err
     assert "manual, two-session procedure" in err
     assert "Traceback" not in err
+
+
+# --- 2026-08-20 review: reporting failure is not partial mutation ------------
+
+def test_reporting_failure_after_a_verified_apply_is_not_partial_mutation(
+        files, monkeypatch, capsys):
+    """An OSError while printing an edge's own report (broken pipe from
+    `--apply | head`, disk full) lands AFTER apply_edge proved convergence.
+    The partial-apply account used to still carry the edge in `mutating` and
+    told the operator it "may be partially mutated" with "edge(s) fully
+    applied before it: none" — a hunt for damage that provably cannot exist."""
+    config, desired = files
+    provider = FakeProvider([])
+    monkeypatch.setattr(cli, "_build_providers",
+                        lambda cfg, edges=None: {"azure-private": provider})
+
+    def boom(*args, **kwargs):
+        raise OSError("broken pipe")
+
+    monkeypatch.setattr(cli, "_print_diff", boom)
+    code = cli.main(["--apply", "--config", str(config),
+                     "--desired-from-file", str(desired)])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert provider.applied
+    assert "may be partially mutated" not in err
+    assert "applied and verified convergence" in err
+    assert "azure-private" in err
+
+
+# --- federated truth: [[sources]] end to end ---------------------------------
+
+def _federated_config(tmp_path, sources_toml):
+    config = tmp_path / "config.toml"
+    config.write_text(TWO_EDGE_CONFIG + sources_toml)
+    return config
+
+
+def _team_snapshot(tmp_path, filename, entries):
+    path = tmp_path / filename
+    path.write_text(snapshot(entries))
+    return path
+
+
+def test_federated_sources_merge_into_one_run(tmp_path, monkeypatch, capsys):
+    """Two teams publish their own truth (here: two snapshot files, the
+    lowest-friction federation); one run gathers both and reconciles every
+    edge against the merged desired set."""
+    team_a = _team_snapshot(tmp_path, "team-a.json", [APP])
+    team_b = _team_snapshot(tmp_path, "team-b.json", [TWO_EDGE_DESIRED[1]])
+    config = _federated_config(tmp_path, f"""
+[[sources]]
+name = "team-a"
+type = "snapshot"
+path = "{team_a}"
+zones = ["azure.example.com"]
+
+[[sources]]
+name = "team-b"
+type = "snapshot"
+path = "{team_b}"
+zones = ["example.com"]
+""")
+    providers = {"azure-private": FakeProvider([]), "cloudflare-public": FakeProvider([])}
+    monkeypatch.setattr(cli, "_build_providers", lambda cfg, edges=None: providers)
+    code = cli.main(["--dry-run", "--config", str(config)])
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "[azure-private] ADD    app A" in out
+    assert "[cloudflare-public] ADD    demo CNAME" in out
+    assert "summary: 2 add, 0 update, 0 delete across 2 edge(s)" in out
+
+
+def test_an_edge_zone_no_source_covers_is_an_error(tmp_path, monkeypatch, capsys):
+    team_a = _team_snapshot(tmp_path, "team-a.json", [APP])
+    config = _federated_config(tmp_path, f"""
+[[sources]]
+name = "team-a"
+type = "snapshot"
+path = "{team_a}"
+zones = ["azure.example.com"]
+""")
+    monkeypatch.setattr(cli, "_build_providers", lambda cfg, edges=None: {})
+    code = cli.main(["--dry-run", "--config", str(config)])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "not covered by any [[sources]]" in err
+
+
+def test_edge_filter_skips_building_unselected_sources(tmp_path, monkeypatch):
+    """A servicenow source for an unselected zone must be neither built nor
+    asked for its credentials — the same --edge principle the truth fetch
+    already applies to zones."""
+    team_a = _team_snapshot(tmp_path, "team-a.json", [APP])
+    config = _federated_config(tmp_path, f"""
+[[sources]]
+name = "team-a"
+type = "snapshot"
+path = "{team_a}"
+zones = ["azure.example.com"]
+
+[[sources]]
+name = "sn"
+type = "servicenow"
+base_url = "https://example.service-now.com"
+zones = ["example.com"]
+table = "cmdb_ci_server"
+name_field = "host_name"
+value_field = "ip_address"
+rtype = "A"
+""")
+    for var in ("SERVICENOW_TOKEN", "SERVICENOW_USERNAME", "SERVICENOW_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    provider = FakeProvider([record("app")])
+    monkeypatch.setattr(cli, "_build_providers",
+                        lambda cfg, edges=None: {"azure-private": provider})
+    code = cli.main(["--dry-run", "--config", str(config),
+                     "--edge", "azure-private"])
+    assert code == 0  # converged, and no missing-SERVICENOW_* error
+
+
+def test_a_source_conflict_is_an_operational_error(tmp_path, monkeypatch, capsys):
+    """Both teams claim azure/app: ownership must never depend on which
+    source answered first, so the run refuses before touching any edge."""
+    team_a = _team_snapshot(tmp_path, "team-a.json", [APP])
+    team_b = _team_snapshot(tmp_path, "team-b.json", [APP])
+    config = _federated_config(tmp_path, f"""
+[[sources]]
+name = "team-a"
+type = "snapshot"
+path = "{team_a}"
+zones = ["azure.example.com", "example.com"]
+
+[[sources]]
+name = "team-b"
+type = "snapshot"
+path = "{team_b}"
+zones = ["azure.example.com"]
+""")
+    provider = FakeProvider([record("app")])
+    monkeypatch.setattr(cli, "_build_providers",
+                        lambda cfg, edges=None: {"azure-private": provider})
+    code = cli.main(["--dry-run", "--config", str(config),
+                     "--edge", "azure-private"])
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "'team-a' and 'team-b' both carry" in err
+
+
+def test_export_gathers_every_source_into_one_snapshot(tmp_path, monkeypatch, capsys):
+    """--export is the 'all information in one place' artifact: the merged,
+    checksummed desired set across every source."""
+    team_a = _team_snapshot(tmp_path, "team-a.json", [APP])
+    team_b = _team_snapshot(tmp_path, "team-b.json", [TWO_EDGE_DESIRED[1]])
+    config = _federated_config(tmp_path, f"""
+[[sources]]
+name = "team-a"
+type = "snapshot"
+path = "{team_a}"
+zones = ["azure.example.com"]
+
+[[sources]]
+name = "team-b"
+type = "snapshot"
+path = "{team_b}"
+zones = ["example.com"]
+""")
+    out = tmp_path / "merged.json"
+    code = cli.main(["--export", str(out), "--config", str(config)])
+    assert code == 0
+    merged = json.loads(out.read_text())
+    assert merged["count"] == 2 and merged["truth_verified"] is True
+    zones = {entry["zone"] for entry in merged["records"]}
+    assert zones == {"azure.example.com", "example.com"}

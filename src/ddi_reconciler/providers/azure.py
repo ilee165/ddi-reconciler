@@ -61,6 +61,11 @@ from ddi_reconciler.model import (
     canonical_record_key,
 )
 
+# Azure Private DNS accepts TTLs of 1..2^31-1 and rejects anything else with a
+# 400 that never names TTL as the cause. The model's own floor is 0 (a legal
+# DNS TTL), so the provider bound has to be enforced here.
+_TTL_MIN, _TTL_MAX = 1, 2**31 - 1
+
 
 class AzureProvider:
     def __init__(self, subscription_id: str, resource_group: str, client=None):
@@ -119,9 +124,19 @@ class AzureProvider:
                     raise RuntimeError(
                         f"azure API error listing {zone}: record set is missing "
                         f"name/type/ttl ({exc})") from exc
-                if rtype not in SUPPORTED_RECORD_TYPES:
-                    continue
                 key = canonical_record_key(zone_key, name, rtype)
+                if rtype not in SUPPORTED_RECORD_TYPES:
+                    # Not representable, but physically present (SOA and NS
+                    # exist in every zone) — record it silently so the
+                    # runner's CR-04 preflight sees the owner name as
+                    # occupied: a desired CNAME create there can never be
+                    # applied, because Azure rejects a CNAME PUT beside any
+                    # existing type. An unsupported type can never be a
+                    # managed key (config refuses those), so this entry can
+                    # only ever feed the observed-keys set, not a refusal.
+                    self.unparseable_keys.setdefault(
+                        key, f"unsupported record type {rtype}")
+                    continue
                 # Fail closed: only an explicit False is "manual, safe to write".
                 if getattr(rs, "is_auto_registered", None) is not False:
                     self.blocked_keys.add(key)
@@ -233,6 +248,13 @@ class AzureProvider:
                 "azure API error: refusing to write managed record set(s) that could not be "
                 f"read at the edge, so the diff for them is not trustworthy — {detail}")
 
+    @staticmethod
+    def _check_ttl(record: CanonicalRecord) -> None:
+        if not (_TTL_MIN <= record.ttl <= _TTL_MAX):
+            raise RuntimeError(
+                f"azure rejects ttl={record.ttl} for {'/'.join(record.key)}: use "
+                f"{_TTL_MIN}-{_TTL_MAX}")
+
     def _require_etag(self, record: CanonicalRecord) -> str:
         etag = self._etags.get(record.key)
         if not etag:
@@ -245,6 +267,11 @@ class AzureProvider:
 
     def apply(self, diff: Diff) -> None:
         self._guard([*diff.to_add, *(u.desired for u in diff.to_update), *diff.to_delete])
+        # TTL preflight across the whole diff (same principle and placement as
+        # the Cloudflare adapter's WR-03): a per-op 400 would land only after
+        # earlier writes had already gone out, leaving avoidable partial state.
+        for record in (*diff.to_add, *(u.desired for u in diff.to_update)):
+            self._check_ttl(record)
         # Resolve every ETag before the first call, for the same reason
         # _guard() vets every record first: all-or-nothing, or the writes
         # ordered ahead of the refused one land anyway.

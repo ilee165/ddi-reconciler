@@ -101,7 +101,7 @@ _TIMEOUT = 10
 
 # Canonical ASCII non-negative integer: no sign, no leading zeros (except "0"
 # itself), no Unicode digits — Python's \d matches "١٢٣", and int() would then
-# happily parse it. REVIEW.md CR-02.
+# happily parse it. review finding CR-02.
 _CANONICAL_INT = re.compile(r"^(0|[1-9][0-9]*)$")
 
 
@@ -196,16 +196,18 @@ class SpatiumProvider:
         self.base_url = base_url.rstrip("/")
         # Whether every response in the last fetch_desired() could be accounted
         # for — see the module docstring for what "accounted for" means per body
-        # shape. False until a fetch proves otherwise: an unread provider has
-        # proven nothing.
+        # shape. False until a COMPLETED fetch proves otherwise: an unread
+        # provider has proven nothing, and neither has one whose fetch raised.
         self.read_verified = False
+        # Per-fetch accumulator behind read_verified — see _read().
+        self._walk_verified = False
         self._session = requests.Session()
         if token:
             self._refuse_plaintext()
             self._session.headers["Authorization"] = f"Bearer {token}"
 
     def _refuse_plaintext(self) -> None:
-        """REVIEW.md CR-03: a bearer token over non-loopback plaintext http is
+        """review finding CR-03: a bearer token over non-loopback plaintext http is
         refused at construction, before the token ever touches a session
         header. This used to be a warning, on the theory that refusal would
         break the documented lab — but the lab is `http://localhost:8000`,
@@ -310,13 +312,22 @@ class SpatiumProvider:
         has_link, link = self._explicit_next(body, current_url, path)
         if has_link:
             return link, malformed
+        # Every branch below echoes metadata back as request parameters, and
+        # each echoed parameter uses the key the DEPLOYMENT declared it under
+        # (the _FieldLookup rationale): sending "offset" to a server that
+        # answers to "skip" renames the parameter, the server serves its
+        # default page again, and the duplicate-item check kills the walk.
+        # Only when the body never named the field is a conventional default
+        # the best available guess.
+        #
         # Page-numbered envelope that declares how many pages there are
         # (fastapi-pagination Page: page/pages/size).
         if pages.value is not None:
             current = (page_number if current_page.value is None
                        else current_page.value)
             next_url = (None if current >= pages.value
-                        else _with_query(current_url, {"page": current + 1}))
+                        else _with_query(current_url, {
+                            current_page.key or "page": current + 1}))
             return next_url, malformed
         # Page-numbered envelope that declares only a total — SpatiumDDI's
         # {items, total, page, page_size}. There is no page count and no next
@@ -324,7 +335,7 @@ class SpatiumProvider:
         # An empty page ends the walk even with the total unmet; the short-read
         # check below is what turns that into an error.
         if current_page.value is not None and total is not None and consumed < total and page_len:
-            params = {"page": current_page.value + 1}
+            params = {current_page.key: current_page.value + 1}
             if size.value is not None:
                 params[size.key] = size.value
             return _with_query(current_url, params), malformed
@@ -332,9 +343,10 @@ class SpatiumProvider:
         # from the declared total: there is more to read and no link to it.
         if total is not None and consumed < total and page_len:
             return _with_query(current_url, {
-                "offset": (consumed - page_len if offset.value is None
-                           else offset.value) + page_len,
-                "limit": page_len if size.value is None else size.value}), malformed
+                offset.key or "offset": (consumed - page_len if offset.value is None
+                                         else offset.value) + page_len,
+                size.key or "limit": page_len if size.value is None
+                else size.value}), malformed
         return None, malformed
 
     def _read(self, path: str) -> list:
@@ -343,9 +355,16 @@ class SpatiumProvider:
         One unaccountable response anywhere — the group listing, a zone listing
         or any records page — makes the whole desired set unprovable, because a
         group or zone that never arrives drops every record underneath it.
+
+        The verdict accumulates in `_walk_verified`, not `read_verified`
+        directly: the public flag is deletion authority (TruthSource contract,
+        providers/base.py), so it must hold False for the whole fetch and take
+        the accumulated verdict only once the fetch has actually completed. A
+        fetch that dies mid-walk with the flag already True would let a caller
+        that catches the error inherit deletion authority from a failed read.
         """
         items, verified = self._get(path)
-        self.read_verified = self.read_verified and verified
+        self._walk_verified = self._walk_verified and verified
         return items
 
     def _get(self, path: str) -> tuple[list, bool]:
@@ -522,7 +541,11 @@ class SpatiumProvider:
     def fetch_desired(self, zones: set[str]) -> list[CanonicalRecord]:
         wanted = {canonical_name(z) for z in zones}
         grouped: dict[tuple[str, str, str], dict] = {}
-        self.read_verified = True  # every _read() below can only take this away
+        # Fail closed for the duration of the fetch: read_verified takes the
+        # accumulated verdict only on the successful return below, so an
+        # exception anywhere in the walk leaves it False, never a stale True.
+        self.read_verified = False
+        self._walk_verified = True  # every _read() below can only take this away
         for group in self._read(GROUPS_PATH):
             group_id = self._segment(
                 self._field(group, "id", "dns group entry"), "dns group entry")
@@ -591,4 +614,6 @@ class SpatiumProvider:
                     f"spatium API error: truth record {zone_name}/{name}/{rtype} is "
                     f"malformed: {exc}. Refusing to drop it — a desired record that never "
                     "arrives reads as a delete order for that key.") from exc
+        # Only a fetch that got this far may publish its verdict (see _read).
+        self.read_verified = self._walk_verified
         return records

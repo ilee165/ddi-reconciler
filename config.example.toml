@@ -26,3 +26,34 @@ zone = "example.com"
 managed_keys = [
   ["example.com", "demo", "CNAME"],
 ]
+
+# --- Federated truth (optional) ---------------------------------------------
+# With no [[sources]] declared, SpatiumDDI at [spatium].base_url is the truth
+# for every edge zone (the classic setup above). Declare [[sources]] entries
+# to gather desired state from several systems of record instead — each
+# source speaks ONLY for the zones it declares, every selected edge zone must
+# be covered by some source, and two sources carrying the same record key is
+# a hard error (ownership must never depend on which source answered first).
+#
+# [[sources]]
+# name = "ddi"
+# type = "spatium"                    # base_url defaults to [spatium].base_url
+# zones = ["internal.example.com"]
+#
+# [[sources]]
+# name = "sn-servers"                 # desired A records derived from a CMDB
+# type = "servicenow"                 # table; auth comes from SERVICENOW_TOKEN
+# base_url = "https://example.service-now.com"   # or SERVICENOW_USERNAME/_PASSWORD
+# zones = ["internal.example.com"]
+# table = "cmdb_ci_server"
+# query = "operational_status=1"      # optional sysparm_query scoping
+# name_field = "host_name"            # bare hostname or FQDN
+# value_field = "ip_address"
+# rtype = "A"
+# ttl = 300
+#
+# [[sources]]
+# name = "team-b"                     # a team that just publishes the v2
+# type = "snapshot"                   # snapshot format from their own tooling
+# path = "truth/team-b.json"
+# zones = ["example.com"]
