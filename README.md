@@ -90,6 +90,16 @@ options:
 
 `--dry-run` and `--apply` are mutually exclusive with `--export`; pick one mode per run.
 
+## Federated truth: gathering desired state from several systems of record
+
+Different teams keep inventory in different places — SpatiumDDI, a ServiceNow CMDB, their own exporter. Optional `[[sources]]` entries in `config.toml` declare one truth source each, together with the zones it is authoritative for; a run merges every relevant source into one desired set, and `--export` writes that merged, checksummed snapshot — all information in one place. Three source types ship:
+
+- **`spatium`** — the classic truth API, now scopeable to specific zones.
+- **`servicenow`** — desired records *derived* from one CMDB table via a field mapping (`table`, `name_field`, `value_field`, `rtype`); auth comes from `SERVICENOW_TOKEN` or `SERVICENOW_USERNAME`/`SERVICENOW_PASSWORD` in the environment. Reads are verified against the instance's declared `X-Total-Count`; a row whose mapped fields are empty derives nothing (and is counted on stderr), while a row carrying data the model rejects is a hard error — dropping it would read as a delete order for its key.
+- **`snapshot`** — a committed file in the [snapshot format](docs/snapshot-format.md), so a team can participate by just publishing a checksummed export from whatever tooling they already have.
+
+The merge rules are ownership rules, and every violation is loud: a source may not return records outside its declared zones, two sources carrying the same record key is a hard error even when they agree, every selected edge zone must be covered by some source, and the merged read is `truth_verified` only when every consulted source's read is. `--edge` still keeps runs cheap — a source whose zones the run doesn't touch is neither queried nor asked for credentials. See `config.example.toml` for the full shape; with no `[[sources]]` declared, behavior is unchanged (SpatiumDDI covers every edge zone).
+
 ## Writing your own provider
 
 Edge providers and truth sources are typed `Protocol`s in `ddi_reconciler.providers` (`EdgeProvider`, `TruthSource`) — this is the documented extension point for adding a new place DNS is served from, or a new source of desired state. See the module for the exact method contracts, and [`docs/snapshot-format.md`](docs/snapshot-format.md) for the snapshot envelope a `TruthSource` produces and a downstream run consumes.

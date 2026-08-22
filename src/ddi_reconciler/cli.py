@@ -53,23 +53,77 @@ def _build_providers(config: Config, edges: tuple[EdgeConfig, ...]) -> dict:
     return providers
 
 
+def _build_sources(config: Config, zones: set[str]):
+    """The composite truth source for the zones this run touches.
+
+    Lazy on two axes, both for --edge's sake: a source whose scope the run
+    does not touch is neither constructed nor asked for its credentials, and
+    the per-type imports stay local so a config without that source type
+    never pays for its dependencies. Tests monkeypatch this function.
+    """
+    from ddi_reconciler.providers.composite import CompositeTruthSource, ScopedSource
+
+    children = []
+    for sc in config.sources:
+        if not (set(sc.zones) & zones):
+            continue
+        if sc.type == "spatium":
+            from ddi_reconciler.providers.spatium import SpatiumProvider
+            instance = SpatiumProvider(base_url=sc.base_url,
+                                       token=os.environ.get("SPATIUM_API_TOKEN", ""))
+        elif sc.type == "servicenow":
+            from ddi_reconciler.providers.servicenow import ServiceNowSource
+            token = os.environ.get("SERVICENOW_TOKEN", "")
+            username = password = ""
+            if not token:
+                username = _require_env("SERVICENOW_USERNAME")
+                password = _require_env("SERVICENOW_PASSWORD")
+            instance = ServiceNowSource(
+                sc.base_url, table=sc.table, name_field=sc.name_field,
+                value_field=sc.value_field, rtype=sc.rtype,
+                zones=frozenset(sc.zones), ttl=sc.ttl, query=sc.query,
+                token=token, username=username, password=password)
+        else:  # "snapshot" — load_config admits no other type
+            from ddi_reconciler.providers.composite import SnapshotSource
+            instance = SnapshotSource(Path(sc.path), frozenset(sc.zones))
+        children.append(ScopedSource(sc.name, frozenset(sc.zones), instance))
+    return CompositeTruthSource(children)
+
+
 def _fetch_desired(config: Config, args: argparse.Namespace,
                    edges: tuple[EdgeConfig, ...]) -> tuple[list[CanonicalRecord], bool]:
     """(desired records, whether that read can be proven complete).
 
-    The second element is what runner.plan_edge gates deletions on, and both
-    truth sources answer it the same way: a snapshot verifies its own count and
-    checksum, the SpatiumDDI adapter checks a total the response declared.
-    Neither is allowed to answer "probably".
+    The second element is what runner.plan_edge gates deletions on, and every
+    truth source answers it the same way: a snapshot verifies its own count
+    and checksum, the SpatiumDDI and ServiceNow adapters check a total the
+    response declared, and a federated read is verified only when every
+    consulted source's read is. None of them is allowed to answer "probably".
     """
     if args.desired_from_file:
         return load_desired(Path(args.desired_from_file))
+    # Zones come from the *selected* edges: --edge should not require truth
+    # (or credentials) for zones the run is not touching.
+    zones = {edge.zone for edge in edges}
+    if config.sources:
+        # An edge no source speaks for can never be reconciled: its empty
+        # truth would read as "delete everything" (blocked by the runner's
+        # guards, but as a confusing per-edge refusal, not the actual cause).
+        covered = {zone for sc in config.sources for zone in sc.zones}
+        uncovered = sorted(zones - covered)
+        if uncovered:
+            raise ConfigError(
+                f"edge zone(s) {uncovered} are not covered by any [[sources]] entry; "
+                "an edge with no truth source cannot be reconciled")
+        composite = _build_sources(config, zones)
+        records = composite.fetch_desired(zones)
+        return records, composite.read_verified
+    # No [[sources]] declared: classic single-source config — SpatiumDDI at
+    # [spatium].base_url speaks for every edge zone.
     from ddi_reconciler.providers.spatium import SpatiumProvider
     spatium = SpatiumProvider(base_url=config.spatium_base_url,
                               token=os.environ.get("SPATIUM_API_TOKEN", ""))
-    # Zones come from the *selected* edges: --edge should not require truth for
-    # zones the run is not touching.
-    records = spatium.fetch_desired({edge.zone for edge in edges})
+    records = spatium.fetch_desired(zones)
     return records, spatium.read_verified
 
 

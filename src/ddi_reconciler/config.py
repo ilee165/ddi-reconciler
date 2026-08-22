@@ -1,7 +1,17 @@
 """Load reconciler configuration (config.toml) — no secrets in the file.
 
 Secrets/identity come from the environment at provider-construction time:
-SPATIUM_API_TOKEN, CLOUDFLARE_API_TOKEN, AZURE_SUBSCRIPTION_ID.
+SPATIUM_API_TOKEN, CLOUDFLARE_API_TOKEN, AZURE_SUBSCRIPTION_ID, and — when a
+[[sources]] entry uses type "servicenow" — SERVICENOW_TOKEN or
+SERVICENOW_USERNAME/SERVICENOW_PASSWORD.
+
+Truth can be FEDERATED: each optional [[sources]] table declares one truth
+source (SpatiumDDI, a ServiceNow table, a committed snapshot published by
+another team's tooling) together with the zones it is authoritative for. The
+CLI merges every relevant source into one desired set per run (see
+providers/composite.py for the merge and ownership rules). With no
+[[sources]] declared, the classic single-source behavior stands: SpatiumDDI
+at [spatium].base_url covers every edge zone.
 """
 from __future__ import annotations
 
@@ -10,12 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ddi_reconciler.model import (
+    MAX_TTL,
     SUPPORTED_RECORD_TYPES,
     RecordKey,
     canonical_name,
     canonical_record_key,
     is_valid_dns_name,
 )
+
+SOURCE_TYPES = frozenset({"spatium", "servicenow", "snapshot"})
 
 
 class ConfigError(ValueError):
@@ -31,17 +44,38 @@ class EdgeConfig:
 
 
 @dataclass(frozen=True)
+class SourceConfig:
+    """One [[sources]] entry: a truth source and the zones it may speak for.
+
+    The per-type fields (base_url, path, table, ...) are validated by
+    load_config for the declared type; the others stay at their defaults.
+    """
+    name: str
+    type: str  # one of SOURCE_TYPES
+    zones: tuple[str, ...]
+    base_url: str = ""     # spatium, servicenow
+    path: str = ""         # snapshot
+    table: str = ""        # servicenow
+    query: str = ""        # servicenow (optional sysparm_query)
+    name_field: str = ""   # servicenow
+    value_field: str = ""  # servicenow
+    rtype: str = ""        # servicenow
+    ttl: int = 300         # servicenow (optional)
+
+
+@dataclass(frozen=True)
 class Config:
     spatium_base_url: str
     azure_resource_group: str
     edges: tuple[EdgeConfig, ...]
+    sources: tuple[SourceConfig, ...] = ()
 
 
-def _require_str(entry: dict, field: str) -> str:
+def _require_str(entry: dict, field: str, what: str = "edge") -> str:
     value = entry.get(field)
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(
-            f"invalid edge entry {entry!r}: {field!r} must be a non-empty string")
+            f"invalid {what} entry {entry!r}: {field!r} must be a non-empty string")
     return value.strip()
 
 
@@ -165,8 +199,85 @@ def load_config(path: Path) -> Config:
                 f"[{section}] {field!r} must be a non-empty string, got {value!r}")
         return value.strip()
 
+    spatium_base_url = _provider_str("spatium", "base_url", "http://localhost:8000")
     return Config(
-        spatium_base_url=_provider_str("spatium", "base_url", "http://localhost:8000"),
+        spatium_base_url=spatium_base_url,
         azure_resource_group=_provider_str("azure", "resource_group", "rg-example-lab"),
         edges=tuple(edges),
+        sources=_load_sources(raw, spatium_base_url),
     )
+
+
+def _load_sources(raw: dict, spatium_base_url: str) -> tuple[SourceConfig, ...]:
+    """Parse and validate the optional [[sources]] tables.
+
+    Every mistake here is caught at load time for the same reason the edge
+    checks are: by fetch time, credentials have been read and another team's
+    truth API may already have been called. A source's zones are its
+    AUTHORITY — providers/composite.py refuses records outside them — so an
+    unrepresentable zone would make the whole source silently inert.
+    """
+    raw_sources = raw.get("sources", [])
+    if not isinstance(raw_sources, list):
+        raise ConfigError(
+            f"'sources' must be an array of tables, got {type(raw_sources).__name__}")
+
+    sources: list[SourceConfig] = []
+    seen: set[str] = set()
+    for entry in raw_sources:
+        if not isinstance(entry, dict):
+            raise ConfigError(f"invalid source entry {entry!r}: expected a table")
+        name = _require_str(entry, "name", "source")
+        source_type = _require_str(entry, "type", "source")
+        if source_type not in SOURCE_TYPES:
+            raise ConfigError(
+                f"source {name!r}: unknown type {source_type!r}; supported types are "
+                f"{sorted(SOURCE_TYPES)}")
+        if name in seen:
+            raise ConfigError(f"duplicate source name: {name!r}")
+        seen.add(name)
+
+        raw_zones = entry.get("zones")
+        if not isinstance(raw_zones, list) or not raw_zones \
+                or not all(isinstance(zone, str) and zone.strip() for zone in raw_zones):
+            raise ConfigError(
+                f"source {name!r}: 'zones' must be a non-empty list of zone names")
+        zones = tuple(canonical_name(zone) for zone in raw_zones)
+        bad_zones = sorted(zone for zone in zones if not is_valid_dns_name(zone))
+        if bad_zones:
+            raise ConfigError(
+                f"source {name!r}: zone(s) {bad_zones} are not valid DNS names")
+
+        fields: dict = {"name": name, "type": source_type, "zones": zones}
+        if source_type == "spatium":
+            fields["base_url"] = (_require_str(entry, "base_url", "source")
+                                  if "base_url" in entry else spatium_base_url)
+        elif source_type == "snapshot":
+            fields["path"] = _require_str(entry, "path", "source")
+        elif source_type == "servicenow":
+            fields["base_url"] = _require_str(entry, "base_url", "source")
+            fields["table"] = _require_str(entry, "table", "source")
+            fields["name_field"] = _require_str(entry, "name_field", "source")
+            fields["value_field"] = _require_str(entry, "value_field", "source")
+            rtype = _require_str(entry, "rtype", "source").upper()
+            if rtype not in SUPPORTED_RECORD_TYPES:
+                raise ConfigError(
+                    f"source {name!r}: rtype {rtype!r} is not a supported record "
+                    f"type; supported types are {sorted(SUPPORTED_RECORD_TYPES)}")
+            fields["rtype"] = rtype
+            query = entry.get("query", "")
+            if not isinstance(query, str):
+                raise ConfigError(
+                    f"source {name!r}: 'query' must be a string, got "
+                    f"{type(query).__name__}")
+            fields["query"] = query.strip()
+            ttl = entry.get("ttl", 300)
+            if isinstance(ttl, bool) or not isinstance(ttl, int) \
+                    or not (0 <= ttl <= MAX_TTL):
+                raise ConfigError(
+                    f"source {name!r}: 'ttl' must be an integer between 0 and "
+                    f"{MAX_TTL}, got {ttl!r}")
+            fields["ttl"] = ttl
+
+        sources.append(SourceConfig(**fields))
+    return tuple(sources)
