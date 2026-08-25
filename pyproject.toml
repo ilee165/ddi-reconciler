@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ddi-reconciler"
-version = "0.1.0" # x-release-please-version
+version = "0.2.0" # x-release-please-version
 description = "Safety-first DNS reconciliation: converge Azure Private DNS and Cloudflare toward a verified source of truth"
 readme = "README.md"
 license = "Apache-2.0"
